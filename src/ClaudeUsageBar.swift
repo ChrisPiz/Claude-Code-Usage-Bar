@@ -29,6 +29,54 @@ struct UsageState: Codable {
     }
 }
 
+// MARK: — Model-scoped weekly limits (Fable, ...)
+// Claude Code's statusLine payload only ever emits five_hour and seven_day, so
+// per-model weekly windows are fetched from /api/oauth/usage and cached
+// separately. Cache lives in its own file so the statusLine write path stays
+// untouched and either writer can run first.
+struct ModelLimit: Codable {
+    let displayName:    String
+    let usedPercentage: Double
+    let resetsAt:       Int?
+    enum CodingKeys: String, CodingKey {
+        case displayName    = "display_name"
+        case usedPercentage = "used_percentage"
+        case resetsAt       = "resets_at"
+    }
+    var asLimit: Limit { Limit(usedPercentage: usedPercentage, resetsAt: resetsAt) }
+}
+
+struct ModelUsageState: Codable {
+    let updatedAt: Int
+    let models:    [ModelLimit]
+    enum CodingKeys: String, CodingKey {
+        case updatedAt = "updated_at"
+        case models
+    }
+}
+
+// Shape of the slice of GET /api/oauth/usage that we care about.
+private struct UsageAPIResponse: Decodable {
+    struct Entry: Decodable {
+        struct Scope: Decodable {
+            struct Model: Decodable {
+                let displayName: String?
+                enum CodingKeys: String, CodingKey { case displayName = "display_name" }
+            }
+            let model: Model?
+        }
+        let kind:     String
+        let percent:  Double?
+        let resetsAt: String?
+        let scope:    Scope?
+        enum CodingKeys: String, CodingKey {
+            case kind, percent, scope
+            case resetsAt = "resets_at"
+        }
+    }
+    let limits: [Entry]?
+}
+
 // MARK: — Claude Status
 struct StatusComponent: Codable {
     let id: String
@@ -52,7 +100,12 @@ struct ClaudeStatus {
     let incidents: [StatusIncident]
     let fetchedAt: Date
     var hasIssue: Bool {
-        !incidents.isEmpty || components.contains { $0.status != "operational" }
+        // Dot reflects ACTUAL impact: a watched component (Claude Code / Claude API)
+        // is non-operational. Mere existence of an incident no longer trips the dot,
+        // so informational incidents (e.g. Mythos/Fable suspensions, where all
+        // affected components stay "operational") leave the icon green. Incidents
+        // still populate the menu list and still fire notifications.
+        components.contains { $0.status != "operational" }
     }
 }
 
@@ -73,6 +126,16 @@ enum SetupStatus {
 let appName = "ClaudeUsageBar"
 let homeDirectoryPath = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
 let stateFilePath = homeDirectoryPath + "/.claude/.claude-usage-state.json"
+let modelStateFilePath = homeDirectoryPath + "/.claude/.claude-usage-models.json"
+// Opt-in marker for the per-model feature. A file (not UserDefaults) so the
+// menu bar app and the bash hooks share one switch. Created/removed by the
+// menu toggle, or manually: touch ~/.claude/.claude-usage-models-optin
+let modelOptInPath = homeDirectoryPath + "/.claude/.claude-usage-models-optin"
+let modelUsageTTL = 300
+let modelUsageStaleThreshold = 21600  // hide/flag model data older than 6 h, like the main state file
+let usageAPIURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
+let keychainService = "Claude Code-credentials"
+let credentialsFilePath = homeDirectoryPath + "/.claude/.credentials.json"
 let claudeCodeIconColor = NSColor(calibratedRed: 217.0 / 255.0, green: 119.0 / 255.0, blue: 87.0 / 255.0, alpha: 1.0)
 
 func shellQuoted(_ value: String) -> String {
@@ -94,6 +157,147 @@ func effectiveUsedPercentage(_ limit: Limit, now: Int = Int(Date().timeIntervalS
         return 0
     }
     return Int(limit.usedPercentage)
+}
+
+// MARK: — Model-scoped usage cache
+func modelUsageOptedIn() -> Bool {
+    FileManager.default.fileExists(atPath: modelOptInPath)
+}
+
+func loadModelUsage() -> ModelUsageState? {
+    guard modelUsageOptedIn(),
+          let raw = FileManager.default.contents(atPath: modelStateFilePath),
+          let state = try? JSONDecoder().decode(ModelUsageState.self, from: raw) else {
+        return nil
+    }
+    return state
+}
+
+func modelUsageIsFresh(now: Int = Int(Date().timeIntervalSince1970)) -> Bool {
+    guard let state = loadModelUsage() else { return false }
+    return (now - state.updatedAt) < modelUsageTTL
+}
+
+// The OAuth token Claude Code stores in the login keychain, falling back to
+// ~/.claude/.credentials.json (installs where Claude Code doesn't use the
+// keychain). Keychain is read through /usr/bin/security, the same binary that
+// wrote it, so no extra keychain prompt appears.
+func claudeOAuthToken() -> String? {
+    func extract(_ data: Data) -> String? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let oauth = json["claudeAiOauth"] as? [String: Any],
+              let token = oauth["accessToken"] as? String,
+              !token.isEmpty else {
+            return nil
+        }
+        return token
+    }
+
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    task.arguments = ["find-generic-password", "-s", keychainService, "-w"]
+    let pipe = Pipe()
+    task.standardOutput = pipe
+    task.standardError = FileHandle.nullDevice
+    if (try? task.run()) != nil {
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        if task.terminationStatus == 0, let token = extract(data) {
+            return token
+        }
+    }
+
+    if let data = FileManager.default.contents(atPath: credentialsFilePath) {
+        return extract(data)
+    }
+    return nil
+}
+
+// Rounded to the minute: the API hands out 07:59:59 for the same window the
+// statusLine payload reports as 08:00:00, which would render as two different
+// reset times sitting one row apart.
+func parseISOTimestamp(_ value: String) -> Int? {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    var seconds: Int?
+    if let date = formatter.date(from: value) {
+        seconds = Int(date.timeIntervalSince1970)
+    } else {
+        formatter.formatOptions = [.withInternetDateTime]
+        if let date = formatter.date(from: value) { seconds = Int(date.timeIntervalSince1970) }
+    }
+    guard let seconds else { return nil }
+    return ((seconds + 30) / 60) * 60
+}
+
+// Exit codes: 0 = cache rewritten, 2 = still fresh (nothing done),
+// 3 = feature not opted in, 1 = failed. Callers rely on these to avoid
+// re-triggering themselves in a loop.
+@discardableResult
+func refreshModelUsage(force: Bool) -> Int32 {
+    guard modelUsageOptedIn() else { return 3 }
+    let now = Int(Date().timeIntervalSince1970)
+    if !force && modelUsageIsFresh(now: now) { return 2 }
+    guard let token = claudeOAuthToken() else { return 1 }
+
+    var request = URLRequest(url: usageAPIURL, timeoutInterval: 10)
+    request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+    var payload: Data?
+    var httpStatus = 0
+    let semaphore = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: request) { data, response, _ in
+        httpStatus = (response as? HTTPURLResponse)?.statusCode ?? 0
+        payload = data
+        semaphore.signal()
+    }.resume()
+    _ = semaphore.wait(timeout: .now() + 12)
+
+    // An expired token or a hiccup must not wipe the last known percentages.
+    guard httpStatus == 200,
+          let payload,
+          let decoded = try? JSONDecoder().decode(UsageAPIResponse.self, from: payload) else {
+        return 1
+    }
+
+    let models: [ModelLimit] = (decoded.limits ?? []).compactMap { entry in
+        guard entry.kind == "weekly_scoped",
+              let name = entry.scope?.model?.displayName, !name.isEmpty,
+              let percent = entry.percent else { return nil }
+        return ModelLimit(displayName: name,
+                          usedPercentage: percent,
+                          resetsAt: entry.resetsAt.flatMap(parseISOTimestamp))
+    }
+
+    let state = ModelUsageState(updatedAt: now, models: models)
+    do {
+        try FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: homeDirectoryPath + "/.claude"),
+            withIntermediateDirectories: true
+        )
+        let data = try JSONEncoder().encode(state)
+        try data.write(to: URL(fileURLWithPath: modelStateFilePath), options: .atomic)
+    } catch {
+        return 1
+    }
+    return 0
+}
+
+// Fire off `--refresh-models` in a detached copy of this binary so neither the
+// statusLine render nor the menu redraw ever waits on the network.
+@discardableResult
+func spawnModelRefresh(force: Bool = false, onFinish: ((Int32) -> Void)? = nil) -> Bool {
+    guard let executablePath = Bundle.main.executablePath else { return false }
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: executablePath)
+    task.arguments = force ? ["--refresh-models", "--force"] : ["--refresh-models"]
+    task.standardOutput = FileHandle.nullDevice
+    task.standardError = FileHandle.nullDevice
+    if let onFinish {
+        task.terminationHandler = { proc in onFinish(proc.terminationStatus) }
+    }
+    return (try? task.run()) != nil
 }
 
 func renderStatusLine() {
@@ -119,6 +323,16 @@ func renderStatusLine() {
     if let limit = limits.sevenDaySonnet {
         let pct = pctText(limit)
         parts.append("\(ansiForPct(limit.usedPercentage))7dS:\(pct)%\(reset)")
+    }
+    // Skip model badges entirely once the cache is too old to trust — a badge
+    // showing last week's Fable % is worse than no badge.
+    if let modelState = loadModelUsage(),
+       Int(Date().timeIntervalSince1970) - modelState.updatedAt <= modelUsageStaleThreshold {
+        for model in modelState.models {
+            let initial = model.displayName.prefix(1).uppercased()
+            let pct = pctText(model.asLimit)
+            parts.append("\(ansiForPct(model.usedPercentage))7d\(initial):\(pct)%\(reset)")
+        }
     }
 
     var prefix = ""
@@ -148,6 +362,8 @@ func renderStatusLine() {
     } catch {
         // Statusline rendering should not fail just because state persistence failed.
     }
+
+    if !modelUsageIsFresh() { spawnModelRefresh() }
 }
 
 func configureClaudeStatusLine() -> SetupStatus {
@@ -287,17 +503,17 @@ func makeStatusBadgedIcon(size: CGFloat) -> NSImage {
 
 // MARK: — i18n
 struct L {
-    let heading, session, weekly, weeklySonnet, resets, updated, refresh, close, noData, noDataSub, stale: String
-    let statusHeading, operational, degraded, outage, alertsToggle, statusLoading: String
+    let heading, session, weekly, weeklySonnet, weeklyModel, resets, updated, refresh, close, noData, noDataSub, stale: String
+    let statusHeading, operational, degraded, outage, alertsToggle, modelToggle, statusLoading: String
     let used, resetsIn, resetsOn, resetsAt: String
     static func detect() -> L {
         let code = Locale.current.language.languageCode?.identifier ?? "en"
         switch code {
-        case "es": return L(heading:"Claude Code — Límites de uso",session:"Sesión actual",weekly:"Límites semanales",weeklySonnet:"",resets:"↻",updated:"Actualizado",refresh:"Actualizar",close:"Cerrar",noData:"Sin datos de uso",noDataSub:"Envía un mensaje en Claude Code",stale:" (desactualizado)",statusHeading:"Status Claude",operational:"Operativo",degraded:"Con problemas",outage:"Sin servicio",alertsToggle:"Alertas de incidentes",statusLoading:"Obteniendo estado...",used:"usado",resetsIn:"Se restablece en",resetsOn:"Se restablece el",resetsAt:"a las")
-        case "pt": return L(heading:"Claude Code — Limites de uso",session:"Sessão atual",weekly:"Limites semanais",weeklySonnet:"",resets:"↻",updated:"Atualizado",refresh:"Atualizar",close:"Fechar",noData:"Sem dados de uso",noDataSub:"Envie uma mensagem no Claude Code",stale:" (desatualizado)",statusHeading:"Status Claude",operational:"Operativo",degraded:"Com problemas",outage:"Fora do ar",alertsToggle:"Alertas de incidentes",statusLoading:"Obtendo status...",used:"usado",resetsIn:"Reinicia em",resetsOn:"Reinicia na",resetsAt:"às")
-        case "fr": return L(heading:"Claude Code — Limites d'utilisation",session:"Session actuelle",weekly:"Limites hebdomadaires",weeklySonnet:"",resets:"↻",updated:"Mis à jour",refresh:"Actualiser",close:"Fermer",noData:"Aucune donnée",noDataSub:"Envoyez un message dans Claude Code",stale:" (périmé)",statusHeading:"Statut Claude",operational:"Opérationnel",degraded:"Problèmes",outage:"Hors ligne",alertsToggle:"Alertes d'incidents",statusLoading:"Chargement...",used:"utilisé",resetsIn:"Réinitialisation dans",resetsOn:"Réinitialisation le",resetsAt:"à")
-        case "de": return L(heading:"Claude Code — Nutzungslimits",session:"Aktuelle Sitzung",weekly:"Wochenlimits",weeklySonnet:"",resets:"↻",updated:"Aktualisiert",refresh:"Aktualisieren",close:"Schließen",noData:"Keine Daten",noDataSub:"Sende eine Nachricht in Claude Code",stale:" (veraltet)",statusHeading:"Claude-Status",operational:"Verfügbar",degraded:"Probleme",outage:"Nicht verfügbar",alertsToggle:"Störungsmeldungen",statusLoading:"Wird geladen...",used:"genutzt",resetsIn:"Zurückgesetzt in",resetsOn:"Zurückgesetzt am",resetsAt:"um")
-        default:   return L(heading:"Claude Code — Usage Limits",session:"Current session",weekly:"Weekly limits",weeklySonnet:"",resets:"↻",updated:"Updated",refresh:"Refresh",close:"Close",noData:"No usage data yet",noDataSub:"Send a message in Claude Code",stale:" (stale)",statusHeading:"Claude System Status",operational:"Online",degraded:"Issues",outage:"Down",alertsToggle:"Incident Alerts",statusLoading:"Fetching status...",used:"used",resetsIn:"Resets in",resetsOn:"Resets on",resetsAt:"at")
+        case "es": return L(heading:"Claude Code — Límites de uso",session:"Sesión actual",weekly:"Límites semanales",weeklySonnet:"",weeklyModel:"Semanal (%@)",resets:"↻",updated:"Actualizado",refresh:"Actualizar",close:"Cerrar",noData:"Sin datos de uso",noDataSub:"Envía un mensaje en Claude Code",stale:" (desactualizado)",statusHeading:"Status Claude",operational:"Operativo",degraded:"Con problemas",outage:"Sin servicio",alertsToggle:"Alertas de incidentes",modelToggle:"Límites por modelo",statusLoading:"Obteniendo estado...",used:"usado",resetsIn:"Se restablece en",resetsOn:"Se restablece el",resetsAt:"a las")
+        case "pt": return L(heading:"Claude Code — Limites de uso",session:"Sessão atual",weekly:"Limites semanais",weeklySonnet:"",weeklyModel:"Semanal (%@)",resets:"↻",updated:"Atualizado",refresh:"Atualizar",close:"Fechar",noData:"Sem dados de uso",noDataSub:"Envie uma mensagem no Claude Code",stale:" (desatualizado)",statusHeading:"Status Claude",operational:"Operativo",degraded:"Com problemas",outage:"Fora do ar",alertsToggle:"Alertas de incidentes",modelToggle:"Límites por modelo",statusLoading:"Obtendo status...",used:"usado",resetsIn:"Reinicia em",resetsOn:"Reinicia na",resetsAt:"às")
+        case "fr": return L(heading:"Claude Code — Limites d'utilisation",session:"Session actuelle",weekly:"Limites hebdomadaires",weeklySonnet:"",weeklyModel:"Hebdo (%@)",resets:"↻",updated:"Mis à jour",refresh:"Actualiser",close:"Fermer",noData:"Aucune donnée",noDataSub:"Envoyez un message dans Claude Code",stale:" (périmé)",statusHeading:"Statut Claude",operational:"Opérationnel",degraded:"Problèmes",outage:"Hors ligne",alertsToggle:"Alertes d'incidents",modelToggle:"Limites par modèle",statusLoading:"Chargement...",used:"utilisé",resetsIn:"Réinitialisation dans",resetsOn:"Réinitialisation le",resetsAt:"à")
+        case "de": return L(heading:"Claude Code — Nutzungslimits",session:"Aktuelle Sitzung",weekly:"Wochenlimits",weeklySonnet:"",weeklyModel:"Woche (%@)",resets:"↻",updated:"Aktualisiert",refresh:"Aktualisieren",close:"Schließen",noData:"Keine Daten",noDataSub:"Sende eine Nachricht in Claude Code",stale:" (veraltet)",statusHeading:"Claude-Status",operational:"Verfügbar",degraded:"Probleme",outage:"Nicht verfügbar",alertsToggle:"Störungsmeldungen",modelToggle:"Limits pro Modell",statusLoading:"Wird geladen...",used:"genutzt",resetsIn:"Zurückgesetzt in",resetsOn:"Zurückgesetzt am",resetsAt:"um")
+        default:   return L(heading:"Claude Code — Usage Limits",session:"Current session",weekly:"Weekly limits",weeklySonnet:"",weeklyModel:"Weekly (%@)",resets:"↻",updated:"Updated",refresh:"Refresh",close:"Close",noData:"No usage data yet",noDataSub:"Send a message in Claude Code",stale:" (stale)",statusHeading:"Claude System Status",operational:"Online",degraded:"Issues",outage:"Down",alertsToggle:"Incident Alerts",modelToggle:"Per-Model Limits",statusLoading:"Fetching status...",used:"used",resetsIn:"Resets in",resetsOn:"Resets on",resetsAt:"at")
         }
     }
 }
@@ -311,6 +527,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     let stateFile = stateFilePath
     var statusTimer: Timer?
     var claudeStatus: ClaudeStatus?
+    var isRefreshingModels = false
     let statusFetchURL = URL(string: "https://status.claude.com/api/v2/summary.json")!
     var isFetchingStatus = false
 
@@ -344,6 +561,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
 
     func update() {
         let l = L.detect()
+        let modelUsage = loadModelUsage()
+        refreshModelUsageIfStale()
         if let btn = statusItem.button {
             btn.image = (claudeStatus?.hasIssue == true)
                 ? makeStatusBadgedIcon(size: 18)
@@ -385,6 +604,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
                     if !rel.isEmpty { m.addPlain(rel, size: 11, gray: true) }
                 }
             }
+            if let mu = modelUsage {
+                // Flag rows whose data has gone stale (expired token, offline):
+                // the percentages stay visible but marked, mirroring the main
+                // state file's stale handling.
+                let modelStale = (now - mu.updatedAt) > modelUsageStaleThreshold ? l.stale : ""
+                for model in mu.models {
+                    let label = String(format: l.weeklyModel, model.displayName)
+                    m.addRow(label,
+                             value: "\(effectiveUsedPercentage(model.asLimit, now: now))%\(modelStale) \(l.used)",
+                             symbol: "sparkles")
+                    if let ts = model.resetsAt {
+                        let rel = relativeReset(ts, now: now, l: l)
+                        if !rel.isEmpty { m.addPlain(rel, size: 11, gray: true) }
+                    }
+                }
+            }
             m.addItem(.separator())
             m.addPlain("\(l.updated) \(fmt(state.updatedAt))", size: 11, gray: true)
         } else {
@@ -421,6 +656,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         alertsItem.state = alertsOn ? .on : .off
         m.addItem(alertsItem)
 
+        // Per-model limits are opt-in: enabling reads the Claude Code OAuth
+        // token (keychain / ~/.claude/.credentials.json) to query the account
+        // usage endpoint. Off by default so installing the app changes nothing.
+        let modelToggle = NSMenuItem(title: l.modelToggle, action: #selector(toggleModelUsage), keyEquivalent: "")
+        modelToggle.target = self
+        modelToggle.state = modelUsageOptedIn() ? .on : .off
+        m.addItem(modelToggle)
+
         m.addItem(.separator())
         m.addPlain("About ClaudeUsageBar...", sel: #selector(showAbout), target: self)
         m.addPlain(l.refresh, sel: #selector(doRefresh), target: self)
@@ -452,6 +695,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         let mins  = (diff % 3600) / 60
         if hours > 0 { return "\(l.resetsIn) \(hours) h \(mins) min" }
         return "\(l.resetsIn) \(mins) min"
+    }
+
+    // Model-scoped percentages come from the API, not the statusLine payload, so
+    // the app tops them up itself. Only a refresh that actually rewrote the
+    // cache (exit 0) redraws the menu, otherwise update() would loop on itself.
+    func refreshModelUsageIfStale() {
+        guard !isRefreshingModels, !modelUsageIsFresh() else { return }
+        isRefreshingModels = true
+        let launched = spawnModelRefresh { [weak self] code in
+            DispatchQueue.main.async {
+                self?.isRefreshingModels = false
+                if code == 0 { self?.update() }
+            }
+        }
+        if !launched { isRefreshingModels = false }
     }
 
     func fetchClaudeStatus() {
@@ -504,6 +762,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
             }
         }
         task.resume()
+    }
+
+    @objc func toggleModelUsage() {
+        let fm = FileManager.default
+        if modelUsageOptedIn() {
+            try? fm.removeItem(atPath: modelOptInPath)
+            try? fm.removeItem(atPath: modelStateFilePath)
+        } else {
+            fm.createFile(atPath: modelOptInPath, contents: Data())
+            isRefreshingModels = true
+            let launched = spawnModelRefresh(force: true) { [weak self] _ in
+                DispatchQueue.main.async {
+                    self?.isRefreshingModels = false
+                    self?.update()
+                }
+            }
+            if !launched { isRefreshingModels = false }
+        }
+        update()
     }
 
     @objc func toggleAlerts() {
@@ -733,6 +1010,10 @@ extension NSMenu {
 if CommandLine.arguments.contains("--statusline") {
     renderStatusLine()
     exit(0)
+}
+
+if CommandLine.arguments.contains("--refresh-models") {
+    exit(refreshModelUsage(force: CommandLine.arguments.contains("--force")))
 }
 
 let app = NSApplication.shared

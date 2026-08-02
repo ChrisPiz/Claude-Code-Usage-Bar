@@ -24,6 +24,12 @@ SEVEN_D=$("$JQ" -r '.rate_limits.seven_day.used_percentage // empty' <<< "$INPUT
 SEVEN_D_RESET=$("$JQ" -r '.rate_limits.seven_day.resets_at // empty' <<< "$INPUT" 2>/dev/null)
 SEVEN_DS=$("$JQ" -r '.rate_limits.seven_day_sonnet.used_percentage // empty' <<< "$INPUT" 2>/dev/null)
 
+# Per-model weekly limits (Fable, ...) never arrive in the statusLine payload,
+# so they come from a cache topped up in the background. Never blocks a render.
+MODEL_CACHE="$HOME/.claude/.claude-usage-models.json"
+MODEL_REFRESH="$(dirname "${BASH_SOURCE[0]}")/usage-models-refresh.sh"
+[ -f "$MODEL_REFRESH" ] && (bash "$MODEL_REFRESH" >/dev/null 2>&1 &)
+
 # No usage data yet (first message of session) — stay silent
 [ -z "$FIVE_H" ] && [ -z "$SEVEN_D" ] && exit 0
 
@@ -57,6 +63,18 @@ fi
 if [ -n "$SEVEN_DS" ]; then
   c=$(ansi_for_pct "$SEVEN_DS")
   usage_parts+=("${c}7d♦:${SEVEN_DS}%${RESET}")
+fi
+
+# Skip model badges once the cache is too old to trust (expired token, offline).
+if [ -f "$MODEL_CACHE" ]; then
+  MODEL_UPDATED=$("$JQ" -r '.updated_at // 0' "$MODEL_CACHE" 2>/dev/null || echo 0)
+  if [ $(( $(date +%s) - MODEL_UPDATED )) -le 21600 ]; then
+    while IFS=$'\t' read -r name pct; do
+      [ -z "$name" ] && continue
+      c=$(ansi_for_pct "$pct")
+      usage_parts+=("${c}7d${name:0:1}:${pct}%${RESET}")
+    done < <("$JQ" -r '(.models // [])[] | [.display_name, (.used_percentage | floor)] | @tsv' "$MODEL_CACHE" 2>/dev/null)
+  fi
 fi
 
 usage_text=$(IFS=' '; echo "${usage_parts[*]}")

@@ -63,6 +63,20 @@ fi
 
 ---
 
+## Per-model weekly limits (opt-in)
+
+Some plans have an extra weekly window scoped to a single model (e.g. **Fable**). Claude Code's statusLine payload doesn't include it, so showing it requires querying the account usage endpoint with your Claude Code OAuth token (read from the login keychain, falling back to `~/.claude/.credentials.json`). Because that touches your credentials, the feature is **off by default**.
+
+Enable it from the menu bar (**Per-Model Limits**) or manually:
+
+```bash
+touch ~/.claude/.claude-usage-models-optin
+```
+
+You'll get an extra badge in the statusline (`7dF:71%`) and a "Weekly (Fable)" row in the menu. Results are cached in `~/.claude/.claude-usage-models.json` for 5 minutes; if the data can't be refreshed for over 6 hours (expired token, offline) badges are hidden and menu rows are marked stale. Disable it the same way (toggle off, or delete the marker file); the token itself is never stored anywhere.
+
+---
+
 ## Building a DMG
 
 For maintainers:
