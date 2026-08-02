@@ -64,8 +64,10 @@ install_script() {
 
 echo "Installing scripts to $HOOKS_DEST ..."
 install_script "usage-statusline.sh"
+install_script "usage-models-refresh.sh"
 install_script "claude-usage-bar.1m.sh"
 echo "  ✓ usage-statusline.sh"
+echo "  ✓ usage-models-refresh.sh"
 echo "  ✓ claude-usage-bar.1m.sh"
 
 # ── Wire settings.json ───────────────────────────────────────────────────────
@@ -191,3 +193,8 @@ fi
 
 echo ""
 echo "Done! Send a message in Claude Code to see the usage badges."
+echo ""
+echo "Optional: per-model weekly limits (e.g. Fable) in the badges and menu."
+echo "This reads your Claude Code OAuth token to query the account usage API,"
+echo "so it is OFF by default. Enable via the menu bar toggle (Per-Model"
+echo "Limits) or:  touch ~/.claude/.claude-usage-models-optin"

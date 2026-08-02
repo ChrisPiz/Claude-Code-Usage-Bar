@@ -7,6 +7,7 @@ CLAUDE_DIR="$HOME/.claude"
 HOOKS_DEST="$CLAUDE_DIR/hooks"
 SETTINGS="$CLAUDE_DIR/settings.json"
 STATE_FILE="$CLAUDE_DIR/.claude-usage-state.json"
+MODEL_STATE_FILE="$CLAUDE_DIR/.claude-usage-models.json"
 JQ=$(command -v jq || echo "/usr/bin/jq")
 
 SWIFTBAR_DIR="$HOME/Library/Application Support/SwiftBar"
@@ -17,7 +18,7 @@ echo "claude-usage-bar uninstaller"
 echo ""
 
 # ── Remove hook scripts ───────────────────────────────────────────────────────
-for f in usage-statusline.sh claude-usage-bar.1m.sh; do
+for f in usage-statusline.sh usage-models-refresh.sh claude-usage-bar.1m.sh; do
   if [ -f "$HOOKS_DEST/$f" ]; then
     rm "$HOOKS_DEST/$f"
     echo "  ✓ Removed $HOOKS_DEST/$f"
@@ -28,6 +29,14 @@ done
 if [ -f "$STATE_FILE" ]; then
   rm "$STATE_FILE"
   echo "  ✓ Removed state file"
+fi
+if [ -f "$MODEL_STATE_FILE" ]; then
+  rm "$MODEL_STATE_FILE"
+  echo "  ✓ Removed model usage cache"
+fi
+if [ -f "$CLAUDE_DIR/.claude-usage-models-optin" ]; then
+  rm "$CLAUDE_DIR/.claude-usage-models-optin"
+  echo "  ✓ Removed per-model opt-in marker"
 fi
 
 # ── Remove / restore settings.json entry ─────────────────────────────────────
